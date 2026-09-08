@@ -1,0 +1,53 @@
+name: demo-workflow
+description: A simple demo workflow showing multi-agent collaboration
+version: "1.0"
+
+agents:
+  - id: planner-1
+    type: planner
+    capabilities:
+      - planner
+
+  - id: executor-1
+    type: executor
+    capabilities:
+      - executor
+
+  - id: reporter-1
+    type: reporter
+    capabilities:
+      - reporter
+
+steps:
+  - id: plan-task
+    name: Planning Phase
+    type: plan
+    agent: planner-1
+    input:
+      goal: "Process user request"
+      context:
+        - task-type: planning
+          priority: high
+    depends_on: []
+    timeout: "30s"
+
+  - id: execute-plan
+    name: Execution Phase
+    type: execute
+    agent: executor-1
+    input:
+      plan: "{{plan-task.output}}"
+    depends_on:
+      - plan-task
+    timeout: "60s"
+
+  - id: report-results
+    name: Reporting Phase
+    type: report
+    agent: reporter-1
+    input:
+      summary: "Task completed successfully"
+      data: "{{execute-plan.output}}"
+    depends_on:
+      - execute-plan
+    timeout: "10s"

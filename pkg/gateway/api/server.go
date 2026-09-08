@@ -1,0 +1,861 @@
+package api
+
+import (
+	"context"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+
+	pb "github.com/hivemachine/internal/grpc/pb"
+	"github.com/hivemachine/pkg/gateway/jobs"
+	"github.com/hivemachine/pkg/gateway/pricing"
+	"github.com/hivemachine/pkg/gateway/provider"
+	"github.com/hivemachine/pkg/gateway/proxy"
+	"github.com/hivemachine/pkg/gateway/ws"
+	"github.com/hivemachine/pkg/paygate/receipt"
+)
+
+// coreClient is the subset of grpc.Client that the API server uses.
+type coreClient interface {
+	ListModels(ctx context.Context) (*pb.ListModelsResponse, error)
+	ChatCompletions(ctx context.Context, req *pb.ChatCompletionRequest) (*pb.ChatCompletionResponse, error)
+	Completions(ctx context.Context, req *pb.CompletionRequest) (*pb.CompletionResponse, error)
+	ListProviders(ctx context.Context) (*pb.ListProvidersResponse, error)
+	StreamChatCompletions(ctx context.Context, req *pb.ChatCompletionRequest) (<-chan *pb.StreamChunk, <-chan error)
+}
+
+// receiptStoreiface is used by Server's receipt endpoints.
+type receiptStoreiface interface {
+	Save(r *receipt.Receipt) error
+	ByID(id string) (*receipt.Receipt, error)
+	ByAPIKey(apiKey string) ([]*receipt.Receipt, error)
+	Recent(n int) ([]*receipt.Receipt, error)
+}
+
+// balanceStoreiface is the interface for balance storage backends.
+type balanceStoreiface interface {
+	Get(apiKey string) int64
+	Set(apiKey string, balance int64)
+	Add(apiKey string, delta int64)
+	Deduct(apiKey string, delta int64)
+}
+// quotaStoreiface is the interface for quota storage backends.
+type quotaStoreiface interface {
+	Set(apiKey string, limit int, period time.Duration)
+	Check(apiKey string, maxTokens int) (bool, int)
+	Deduct(apiKey string, tokens int)
+	Remaining(apiKey string) int
+}
+
+// inMemoryBalanceStore holds balances in process memory.
+type inMemoryBalanceStore struct {
+	mu   sync.RWMutex
+	data map[string]*userBalance
+}
+
+type userBalance struct {
+	Balance    int64
+	LastUpdate int64
+}
+
+func newBalanceStore() balanceStoreiface {
+	return &inMemoryBalanceStore{data: make(map[string]*userBalance)}
+}
+
+func (b *inMemoryBalanceStore) Get(apiKey string) int64 {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if ub, ok := b.data[apiKey]; ok {
+		return ub.Balance
+	}
+	return 0
+}
+
+func (b *inMemoryBalanceStore) Set(apiKey string, balance int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.data[apiKey] = &userBalance{Balance: balance, LastUpdate: time.Now().Unix()}
+}
+
+func (b *inMemoryBalanceStore) Add(apiKey string, delta int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ub, ok := b.data[apiKey]
+	if !ok {
+		ub = &userBalance{}
+		b.data[apiKey] = ub
+	}
+	ub.Balance += delta
+	ub.LastUpdate = time.Now().Unix()
+}
+
+// Deduct subtracts delta from the balance. Does nothing if balance would go negative.
+func (b *inMemoryBalanceStore) Deduct(apiKey string, delta int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	ub, ok := b.data[apiKey]
+	if !ok || ub.Balance < delta {
+		return
+	}
+	ub.Balance -= delta
+	ub.LastUpdate = time.Now().Unix()
+}
+
+// Server implements OpenAI-compatible HTTP server.
+type Server struct {
+	addr          string
+	router        *gin.Engine
+	client        coreClient
+	registry      *provider.Registry
+	proxy         *proxy.Proxy
+	balanceStore  balanceStoreiface
+	quotaStore    quotaStoreiface
+	priceStore    *pricing.InMemoryStore
+	receiptStore  receiptStoreiface
+	receiptSigner *receipt.Signer
+	jobsHandler   *jobs.Handler
+	wsHandler     *ws.StreamHandler
+}
+
+// Option configures an optional dependency for Server.
+type Option func(*Server)
+
+// WithBalanceStore replaces the default in-memory balance store with a persistent one.
+func WithBalanceStore(bs balanceStoreiface) Option {
+	return func(s *Server) { s.balanceStore = bs }
+}
+
+// WithReceiptStore replaces the default in-memory receipt store with a persistent one.
+func WithReceiptStore(rs receiptStoreiface) Option {
+	return func(s *Server) { s.receiptStore = rs }
+}
+
+// WithQuotaStore replaces the default no-op quota store with a persistent one.
+func WithQuotaStore(qs quotaStoreiface) Option {
+	return func(s *Server) { s.quotaStore = qs }
+}
+
+// NewServer creates a new gateway server.
+// Variadic Option args configure optional backends (e.g. SQLite balance/receipt stores).
+// If proxy is non-nil, inference calls route through it with failover.
+// If registry is non-nil, /providers uses it for ranked results.
+// If receiptSigner is non-nil, receipts are generated for each inference call.
+func NewServer(addr string, client coreClient, registry *provider.Registry,
+	proxy *proxy.Proxy, receiptSigner *receipt.Signer, opts ...Option) *Server {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(Logger())
+
+	s := &Server{
+		addr:         addr,
+		router:       r,
+		client:       client,
+		registry:     registry,
+		proxy:        proxy,
+		balanceStore: newBalanceStore(),
+		priceStore:   pricing.NewInMemoryStore(),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	if receiptSigner != nil && s.receiptStore == nil {
+		s.receiptSigner = receiptSigner
+		s.receiptStore = receipt.NewInMemoryStore()
+	}
+
+	// Jobs — always available with in-memory store.
+	s.jobsHandler = jobs.NewHandler(jobs.NewInMemoryStore(), nil, extractAPIKey)
+
+	// WebSocket — use proxy for provider routing if available.
+	s.wsHandler = ws.NewStreamHandler(s.client, s.proxy)
+
+	s.setupRoutes()
+	return s
+}
+
+// setupRoutes configures all HTTP endpoints.
+func (s *Server) setupRoutes() {
+	s.router.GET("/health", s.health)
+
+	v1 := s.router.Group("/v1")
+	v1.Use(s.checkQuota())
+	{
+		v1.GET("/models", s.listModels)
+		v1.POST("/chat/completions", s.chatCompletions)
+		v1.POST("/completions", s.completions)
+		v1.POST("/chat/completions/stream", s.streamChatCompletions)
+		v1.GET("/chat/completions/ws", func(c *gin.Context) {
+			s.wsHandler.Handle(c.Writer, c.Request)
+		})
+		v1.GET("/balance", s.getBalance)
+		v1.POST("/balance/topup", s.topUp)
+
+		// Jobs / Workflows.
+		v1.POST("/workflows", s.jobsHandler.Submit)
+		v1.GET("/jobs", s.jobsHandler.ListJobs)
+		v1.GET("/jobs/:id/events", s.jobsHandler.Events)
+		v1.DELETE("/jobs/:id", s.jobsHandler.CancelJob)
+	}
+	if s.receiptStore != nil {
+		v1.GET("/receipts", s.listReceipts)
+		v1.POST("/receipts/verify", s.verifyReceipt)
+		v1.GET("/receipts/public_key", s.receiptPublicKey)
+	}
+	if s.quotaStore != nil {
+		v1.GET("/quota", s.getQuota)
+		v1.POST("/quota", s.setQuota)
+	}
+
+	s.router.GET("/providers", s.listProviders)
+}
+
+// Start begins serving.
+func (s *Server) Addr() string { return s.addr }
+
+func (s *Server) Router() *gin.Engine { return s.router }
+
+func (s *Server) Start() error { return s.router.Run(s.addr) }
+
+// SetBalance pre-funds an API key's balance for testing.
+func (s *Server) SetBalance(apiKey string, amount int64) { s.balanceStore.Set(apiKey, amount) }
+
+// Close shuts down the server.
+func (s *Server) Close() {}
+
+// Logger returns a gin middleware logger.
+func Logger() gin.HandlerFunc {
+	return gin.LoggerWithConfig(gin.LoggerConfig{
+		SkipPaths: []string{"/health"},
+	})
+}
+
+// health returns the server's health status.
+func (s *Server) health(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func extractAPIKey(c *gin.Context) string {
+	hdr := c.GetHeader("Authorization")
+	if strings.HasPrefix(hdr, "Bearer ") {
+		return strings.TrimPrefix(hdr, "Bearer ")
+	}
+	return ""
+}
+
+// listModels lists available models.
+func (s *Server) listModels(c *gin.Context) {
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	resp, err := s.client.ListModels(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": "failed to list models: " + err.Error(),
+		}})
+		return
+	}
+	items := make([]gin.H, 0, len(resp.Models))
+	for _, m := range resp.Models {
+		items = append(items, gin.H{
+			"id":      m.GetId(),
+			"object":  "model",
+			"created": m.GetCreated(),
+			"owned_by": m.GetOwnedBy(),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"object": "list",
+		"data":   items,
+	})
+}
+
+// topUp adds credits to an API key's balance.
+func (s *Server) topUp(c *gin.Context) {
+	apiKey := extractAPIKey(c)
+	if apiKey == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"message": "missing API key"}})
+		return
+	}
+	var req struct {
+		Amount int64 `json:"amount"`
+	}
+	if err := c.BindJSON(&req); err != nil || req.Amount <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "invalid amount"}})
+		return
+	}
+	s.balanceStore.Add(apiKey, req.Amount)
+	c.JSON(http.StatusOK, gin.H{"balance": s.balanceStore.Get(apiKey)})
+}
+
+// getBalance returns the current balance for the authenticated user.
+func (s *Server) getBalance(c *gin.Context) {
+	apiKey := extractAPIKey(c)
+	if apiKey == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"message": "missing API key"}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"balance": s.balanceStore.Get(apiKey)})
+}
+
+// setQuota creates or updates a token quota for the authenticated API key.
+func (s *Server) setQuota(c *gin.Context) {
+	apiKey := extractAPIKey(c)
+	if apiKey == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"message": "missing API key"}})
+		return
+	}
+	if s.quotaStore == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": gin.H{"message": "quota not configured"}})
+		return
+	}
+	var req struct {
+		Limit         int `json:"limit"`
+		PeriodSeconds int `json:"period_seconds"`
+	}
+	if err := c.BindJSON(&req); err != nil || req.Limit <= 0 || req.PeriodSeconds <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "limit and period_seconds required"}})
+		return
+	}
+	s.quotaStore.Set(apiKey, req.Limit, time.Duration(req.PeriodSeconds)*time.Second)
+	c.JSON(http.StatusOK, gin.H{"limit": req.Limit, "period_seconds": req.PeriodSeconds})
+}
+
+// getQuota returns the current quota for the authenticated API key.
+func (s *Server) getQuota(c *gin.Context) {
+	apiKey := extractAPIKey(c)
+	if apiKey == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"message": "missing API key"}})
+		return
+	}
+	if s.quotaStore == nil {
+		c.JSON(http.StatusNotImplemented, gin.H{"error": gin.H{"message": "quota not configured"}})
+		return
+	}
+	remaining := s.quotaStore.Remaining(apiKey)
+	c.JSON(http.StatusOK, gin.H{"remaining": remaining})
+}
+// chatCompletions handles /v1/chat/completions.
+func (s *Server) chatCompletions(c *gin.Context) {
+	var raw struct {
+		Model       string              `json:"model"`
+		Messages    []map[string]string `json:"messages"`
+		Temperature float32             `json:"temperature"`
+		MaxTokens   int                 `json:"max_tokens"`
+	}
+	if err := c.BindJSON(&raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+
+	model := raw.Model
+	if model == "" {
+		model = "mayhem/default"
+	}
+	apiKey := extractAPIKey(c)
+	balance := s.balanceStore.Get(apiKey)
+	if balance <= 0 && apiKey != "" {
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"message": "insufficient balance"}})
+		return
+	}
+
+	temperature := raw.Temperature
+	if temperature == 0 {
+		temperature = 0.7
+	}
+	maxTokens := int32(raw.MaxTokens)
+	if maxTokens == 0 {
+		maxTokens = 1024
+	}
+
+	var lastErr error
+	var resp *pb.ChatCompletionResponse
+	req := &pb.ChatCompletionRequest{
+		Model:       model,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+	}
+	for _, m := range raw.Messages {
+		req.Messages = append(req.Messages, &pb.ChatMessage{
+			Role:    m["role"],
+			Content: m["content"],
+		})
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+
+	if s.proxy != nil {
+		resp, lastErr = s.proxy.ChatCompletions(ctx, req)
+	} else {
+		resp, lastErr = s.client.ChatCompletions(ctx, req)
+	}
+	if lastErr != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": "chat completion failed: " + lastErr.Error(),
+		}})
+		return
+	}
+
+	promptTokens := int(resp.GetUsage().GetPromptTokens())
+	completionTokens := int(resp.GetUsage().GetCompletionTokens())
+	totalTokens := int(resp.GetUsage().GetTotalTokens())
+	costDollars := pricing.ComputeCost(promptTokens, completionTokens, model)
+	costCents := int64(math.Round(costDollars * 100))
+	receiptID := ""
+
+	if s.receiptSigner != nil {
+		apiKey := extractAPIKey(c)
+		r := receipt.NewReceipt(
+			uuid.New().String(),
+			apiKey,
+			model,
+			providerIDFromProxy(s),
+			promptTokens,
+			completionTokens,
+			totalTokens,
+			costCents,
+		)
+		_ = s.receiptSigner.Sign(r)
+		if s.receiptStore != nil {
+			_ = s.receiptStore.Save(r)
+		}
+		receiptID = r.ID
+	}
+
+	// Deduct from balance if a charge applies and the key is tracked.
+	if costCents > 0 {
+		s.balanceStore.Deduct(apiKey, costCents)
+	}
+
+	choices := make([]gin.H, 0, len(resp.GetChoices()))
+	for _, ch := range resp.GetChoices() {
+		choices = append(choices, gin.H{
+			"index": ch.GetIndex(),
+			"message": gin.H{
+				"role":    ch.GetMessage().GetRole(),
+				"content": ch.GetMessage().GetContent(),
+			},
+			"finish_reason": ch.GetFinishReason(),
+		})
+	}
+
+	out := gin.H{
+		"id":      resp.GetId(),
+		"object":  "chat.completion",
+		"created": resp.GetCreated(),
+		"model":   model,
+		"choices": choices,
+		"usage": gin.H{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      totalTokens,
+		},
+	}
+	if receiptID != "" {
+		out["receipt_id"] = receiptID
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+// completions handles /v1/completions.
+func (s *Server) completions(c *gin.Context) {
+	var req struct {
+		Model       string  `json:"model"`
+		Prompt      string  `json:"prompt"`
+		Temperature float32 `json:"temperature"`
+		MaxTokens   int     `json:"max_tokens"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+
+	model := req.Model
+	if model == "" {
+		model = "mayhem/default"
+	}
+	apiKey := extractAPIKey(c)
+	balance := s.balanceStore.Get(apiKey)
+	if balance <= 0 && apiKey != "" {
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"message": "insufficient balance"}})
+		return
+	}
+
+	temperature := req.Temperature
+	if temperature == 0 {
+		temperature = 0.7
+	}
+	maxTokens := int32(req.MaxTokens)
+	if maxTokens == 0 {
+		maxTokens = 1024
+	}
+
+	pbReq := &pb.CompletionRequest{
+		Model:       model,
+		Prompt:      req.Prompt,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+
+	var lastErr error
+	var resp *pb.CompletionResponse
+	if s.proxy != nil {
+		resp, lastErr = s.proxy.Completions(ctx, pbReq)
+	} else {
+		resp, lastErr = s.client.Completions(ctx, pbReq)
+	}
+	if lastErr != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": "completion failed: " + lastErr.Error(),
+		}})
+		return
+	}
+
+	text := resp.GetChoices()[0].GetText()
+	promptTokens := int(resp.GetUsage().GetPromptTokens())
+	completionTokens := int(resp.GetUsage().GetCompletionTokens())
+	totalTokens := int(resp.GetUsage().GetTotalTokens())
+	finishReason := resp.GetChoices()[0].GetFinishReason()
+	apiKey = extractAPIKey(c)
+	costDollars := pricing.ComputeCost(promptTokens, completionTokens, model)
+	costCents := int64(math.Round(costDollars * 100))
+	var receiptID string
+
+	if s.receiptSigner != nil {
+		r := receipt.NewReceipt(
+			uuid.New().String(),
+			apiKey,
+			model,
+			providerIDFromProxy(s),
+			promptTokens,
+			completionTokens,
+			totalTokens,
+			costCents,
+		)
+		_ = s.receiptSigner.Sign(r)
+		if s.receiptStore != nil {
+			_ = s.receiptStore.Save(r)
+		}
+		receiptID = r.ID
+	}
+
+	if costCents > 0 {
+		s.balanceStore.Deduct(apiKey, costCents)
+	}
+
+	out := gin.H{
+		"id":      resp.GetId(),
+		"object":  "text_completion",
+		"created": resp.GetCreated(),
+		"model":   model,
+		"choices": []gin.H{{
+			"text":          text,
+			"index":         0,
+			"finish_reason": finishReason,
+		}},
+		"usage": gin.H{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      totalTokens,
+		},
+	}
+	if receiptID != "" {
+		out["receipt_id"] = receiptID
+	}
+	c.JSON(http.StatusOK, out)
+}
+
+func (s *Server) listProviders(c *gin.Context) {
+	if s.registry != nil {
+		providers := s.registry.Get()
+		items := make([]gin.H, 0, len(providers))
+		for id, state := range providers {
+			items = append(items, gin.H{
+				"id":     id,
+				"status": state.Status,
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"providers": items})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	resp, err := s.client.ListProviders(ctx)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{
+			"message": "failed to list providers: " + err.Error(),
+		}})
+		return
+	}
+	data := make([]gin.H, len(resp.Providers))
+	for i, p := range resp.Providers {
+		data[i] = gin.H{
+			"id":     p.GetId(),
+			"status": p.GetStatus(),
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"providers": data})
+}
+
+func (s *Server) streamChatCompletions(c *gin.Context) {
+	var raw struct {
+		Model       string              `json:"model"`
+		Messages    []map[string]string `json:"messages"`
+		Temperature float32             `json:"temperature"`
+		MaxTokens   int                 `json:"max_tokens"`
+	}
+	if err := c.BindJSON(&raw); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+
+	model := raw.Model
+	if model == "" {
+		model = "mayhem/default"
+	}
+	apiKey := extractAPIKey(c)
+	balance := s.balanceStore.Get(apiKey)
+	if balance <= 0 && apiKey != "" {
+		c.JSON(http.StatusPaymentRequired, gin.H{"error": gin.H{"message": "insufficient balance"}})
+		return
+	}
+
+	temperature := raw.Temperature
+	if temperature == 0 {
+		temperature = 0.7
+	}
+	maxTokens := int32(raw.MaxTokens)
+	if maxTokens == 0 {
+		maxTokens = 1024
+	}
+
+	req := &pb.ChatCompletionRequest{
+		Model:       model,
+		Temperature: temperature,
+		MaxTokens:   maxTokens,
+	}
+	for _, m := range raw.Messages {
+		req.Messages = append(req.Messages, &pb.ChatMessage{
+			Role:    m["role"],
+			Content: m["content"],
+		})
+	}
+
+	// Set SSE headers.
+	c.Header("Content-Type", "text/event-stream")
+	c.Header("Cache-Control", "no-cache")
+	c.Header("Connection", "keep-alive")
+	c.Header("X-Accel-Buffering", "no")
+
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 60*time.Second)
+	defer cancel()
+
+	chunks, errs := s.client.StreamChatCompletions(ctx, req)
+
+	created := time.Now().Unix()
+	var promptTokens, completionTokens int
+
+	for {
+		select {
+		case chunk, ok := <-chunks:
+			if !ok {
+				// Stream finished cleanly — send final usage + done.
+				if promptTokens > 0 || completionTokens > 0 {
+					costDollars := pricing.ComputeCost(promptTokens, completionTokens, model)
+					costCents := int64(math.Round(costDollars * 100))
+					if costCents > 0 {
+						s.balanceStore.Deduct(apiKey, costCents)
+					}
+					if s.receiptSigner != nil && apiKey != "" {
+						r := receipt.NewReceipt(
+							uuid.New().String(),
+							apiKey,
+							model,
+							providerIDFromProxy(s),
+							promptTokens,
+							completionTokens,
+							promptTokens+completionTokens,
+							costCents,
+						)
+						_ = s.receiptSigner.Sign(r)
+						if s.receiptStore != nil {
+							_ = s.receiptStore.Save(r)
+						}
+					}
+					sendSSEChunk(c, "", "stop", created, model, 0, 0, 0)
+				}
+				sendSSEDone(c)
+				return
+			}
+
+			delta := chunk.GetDelta().GetContent()
+			finish := chunk.GetFinishReason()
+
+			if usage := chunk.GetUsage(); usage != nil {
+				promptTokens = int(usage.GetPromptTokens())
+				completionTokens = int(usage.GetCompletionTokens())
+			}
+
+			choice := 0
+			reason := finish
+			sendSSEChunk(c, delta, reason, created, model, choice, promptTokens, completionTokens)
+
+			if finish != "" {
+				// Send final usage if not already sent.
+				costDollars := pricing.ComputeCost(promptTokens, completionTokens, model)
+				costCents := int64(math.Round(costDollars * 100))
+				if costCents > 0 {
+					s.balanceStore.Deduct(apiKey, costCents)
+				}
+				if s.receiptSigner != nil && apiKey != "" {
+					r := receipt.NewReceipt(
+						uuid.New().String(),
+						apiKey,
+						model,
+						providerIDFromProxy(s),
+						promptTokens,
+						completionTokens,
+						promptTokens+completionTokens,
+						costCents,
+					)
+					_ = s.receiptSigner.Sign(r)
+					if s.receiptStore != nil {
+						_ = s.receiptStore.Save(r)
+					}
+				}
+				sendSSEDone(c)
+				return
+			}
+
+		case err, ok := <-errs:
+			if !ok {
+				continue
+			}
+			sendSSEError(c, "stream error: "+err.Error())
+			return
+
+		case <-ctx.Done():
+			sendSSEError(c, "request timeout")
+			return
+		}
+	}
+}
+
+// sendSSEChunk sends a server-sent event for a chat completion chunk.
+func sendSSEChunk(c *gin.Context, delta, finishReason string, created int64, model string, choiceIdx, promptTokens, completionTokens int) {
+	chunk := gin.H{
+		"id":      fmt.Sprintf("chatcmpl-%s", randomID()),
+		"object":  "chat.completion.chunk",
+		"created": created,
+		"model":   model,
+		"choices": []gin.H{{
+			"index": choiceIdx,
+			"delta": gin.H{"content": delta},
+		}},
+	}
+	if finishReason != "" {
+		chunk["choices"].([]gin.H)[0]["finish_reason"] = finishReason
+	}
+	if promptTokens > 0 || completionTokens > 0 {
+		chunk["usage"] = gin.H{
+			"prompt_tokens":     promptTokens,
+			"completion_tokens": completionTokens,
+			"total_tokens":      promptTokens + completionTokens,
+		}
+	}
+	payload, _ := json.Marshal(chunk)
+	c.Writer.Write([]byte("data: " + string(payload) + "\n\n"))
+	c.Writer.Flush()
+}
+
+// sendSSEDone sends the final [DONE] sentinel.
+func sendSSEDone(c *gin.Context) {
+	c.Writer.Write([]byte("data: [DONE]\n\n"))
+	c.Writer.Flush()
+}
+
+// sendSSEError sends an error as an SSE comment and closes the stream.
+func sendSSEError(c *gin.Context, msg string) {
+	c.Writer.Write([]byte(": " + msg + "\n\n"))
+	c.Writer.Flush()
+}
+
+// listReceipts returns recent receipts for the authenticated user.
+func (s *Server) listReceipts(c *gin.Context) {
+	apiKey := extractAPIKey(c)
+	if apiKey == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": gin.H{"message": "missing API key"}})
+		return
+	}
+	receipts, err := s.receiptStore.ByAPIKey(apiKey)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	data := make([]gin.H, 0, len(receipts))
+	for _, r := range receipts {
+		data = append(data, gin.H{
+			"id":                 r.ID,
+			"api_key":           r.APIKey,
+			"model":             r.Model,
+			"provider":          r.ProviderID,
+			"prompt_tokens":     r.PromptTokens,
+			"completion_tokens": r.CompletionTokens,
+			"total_tokens":      r.TotalTokens,
+			"cost_cents":        r.CostCents,
+			"created_at":        r.CreatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"receipts": data})
+}
+
+// verifyReceipt verifies a receipt's Ed25519 signature.
+func (s *Server) verifyReceipt(c *gin.Context) {
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := c.BindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	r, err := s.receiptStore.ByID(req.ID)
+	if err != nil || r == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": gin.H{"message": "receipt not found"}})
+		return
+	}
+	valid := false
+	if s.receiptSigner != nil {
+		valid = s.receiptSigner.Verify(r)
+	}
+	c.JSON(http.StatusOK, gin.H{"valid": valid, "receipt": r})
+}
+
+// receiptPublicKey returns the server's public key for receipt verification.
+func (s *Server) receiptPublicKey(c *gin.Context) {
+	if s.receiptSigner == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "receipt signing not configured"}})
+		return
+	}
+	pubKey := s.receiptSigner.PublicKey()
+	c.JSON(http.StatusOK, gin.H{"public_key": hex.EncodeToString(pubKey)})
+}
+
+// providerIDFromProxy returns a short provider identifier if the proxy is active.
+func providerIDFromProxy(s *Server) string {
+	if s.proxy != nil {
+		return "proxy-routed"
+	}
+	return ""
+}

@@ -1,0 +1,143 @@
+syntax = "proto3";
+
+package mayhem.v1;
+
+option go_package = "github.com/hivemachine/internal/grpc/pb";
+
+// MayhemService mirrors the OpenAI-compatible gateway surface.
+// Go gateway → Rust core via this API.
+service MayhemService {
+  // ListModels returns all models available from the Rust core.
+  rpc ListModels(ListModelsRequest) returns (ListModelsResponse);
+
+  // ChatCompletions handles chat-based inference (unary).
+  rpc ChatCompletions(ChatCompletionRequest) returns (ChatCompletionResponse);
+
+  // Completions handles text completion (unary).
+  rpc Completions(CompletionRequest) returns (CompletionResponse);
+  // StreamCompletions streams text completion chunks.
+  rpc StreamCompletions(CompletionRequest) returns (stream StreamChunk);
+  // StreamChatCompletions streams chat completion chunks.
+  rpc StreamChatCompletions(ChatCompletionRequest) returns (stream StreamChunk);
+
+  // ListProviders returns active providers from the Rust core.
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Shared types
+// ──────────────────────────────────────────────────────────────────
+
+message Usage {
+  int32 prompt_tokens     = 1;
+  int32 completion_tokens = 2;
+  int32 total_tokens      = 3;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Models
+// ──────────────────────────────────────────────────────────────────
+
+message ListModelsRequest {}
+
+message ListModelsResponse {
+  repeated Model models = 1;
+}
+
+message Model {
+  string id       = 1;
+  int64  created  = 2;
+  string owned_by = 3;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Chat Completions
+// ──────────────────────────────────────────────────────────────────
+
+message ChatMessage {
+  string role    = 1;
+  string content = 2;
+  string name    = 3; // optional
+}
+
+message ChatCompletionRequest {
+  string         model       = 1;
+  repeated ChatMessage messages = 2;
+  float          temperature = 3;
+  int32          max_tokens  = 4;
+  bool           stream      = 5;
+}
+
+message ChatChoice {
+  int32        index        = 1;
+  ChatMessage  message      = 2;
+  string       finish_reason = 3;
+}
+
+message ChatCompletionResponse {
+  string         id      = 1;
+  int64          created = 2;
+  string         model   = 3;
+  repeated ChatChoice choices = 4;
+  Usage          usage   = 5;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Text Completions
+// ──────────────────────────────────────────────────────────────────
+
+message CompletionRequest {
+  string  model       = 1;
+  string  prompt     = 2;
+  float   temperature = 3;
+  int32   max_tokens  = 4;
+  bool    stream      = 5;
+}
+
+message CompletionChoice {
+  int32  index        = 1;
+  string text         = 2;
+  string finish_reason = 3;
+}
+
+message CompletionResponse {
+  string              id      = 1;
+  int64               created = 2;
+  string              model   = 3;
+  repeated CompletionChoice choices = 4;
+  Usage               usage   = 5;
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Streaming
+// ──────────────────────────────────────────────────────────────────
+
+message ChoiceDelta {
+  string content = 1;
+}
+
+message StreamChunk {
+  string       id           = 1;
+  string       model        = 2;
+  ChoiceDelta  delta        = 3;
+  string       finish_reason = 4; // set on final chunk only
+  Usage        usage        = 5; // set on final chunk only
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Providers
+// ──────────────────────────────────────────────────────────────────
+
+message ListProvidersRequest {}
+
+message ListProvidersResponse {
+  repeated Provider providers = 1;
+}
+
+message Provider {
+  string id         = 1;
+  string endpoint   = 2;
+  string status     = 3; // "healthy" | "degraded" | "unhealthy"
+  double reputation = 4; // 0.0 – 1.0
+  repeated string models = 5;
+}
