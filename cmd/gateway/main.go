@@ -15,11 +15,14 @@ import (
 	"github.com/hivemachine/pkg/gateway/provider"
 	"github.com/hivemachine/pkg/gateway/proxy"
 	"github.com/hivemachine/pkg/paygate/receipt"
+	"github.com/hivemachine/pkg/paygate/stripe"
 )
 
 func main() {
 	addr := flag.String("addr", "127.0.0.1:11435", "gateway HTTP address")
 	core := flag.String("core", "127.0.0.1:50051", "Rust core gRPC address")
+	stripeKey := flag.String("stripe-secret-key", os.Getenv("STRIPE_SECRET_KEY"), "Stripe secret key (or STRIPE_SECRET_KEY env)")
+	stripeWebhook := flag.String("stripe-webhook-secret", os.Getenv("STRIPE_WEBHOOK_SECRET"), "Stripe webhook secret (or STRIPE_WEBHOOK_SECRET env)")
 	flag.Parse()
 
 	grpcClient := grpc.NewClient(grpc.Config{
@@ -47,8 +50,21 @@ func main() {
 		log.Printf("warning: receipt signer unavailable: %v (receipts disabled)", err)
 	}
 
+	// Build server options.
+	var serverOpts []api.Option
+
+	// Stripe paygate: create balance store first, wire into both paygate and server.
+	var balanceStore api.BalanceStore
+	var paygate *stripe.Paygate
+	if *stripeKey != "" {
+		balanceStore = api.NewInMemoryBalanceStore()
+		paygate = stripe.NewPaygate(*stripeKey, *stripeWebhook, balanceStore)
+		serverOpts = append(serverOpts, api.WithBalanceStore(balanceStore), api.WithStripePaygate(paygate))
+		log.Printf("Stripe configured (key prefix: %s)", (*stripeKey)[:min(8, len(*stripeKey))])
+	}
+
 	log.Printf("Starting HiveMachine Gateway on %s → Rust core at %s", *addr, *core)
-	server := api.NewServer(*addr, grpcClient, registry, inferenceProxy, receiptSigner)
+	server := api.NewServer(*addr, grpcClient, registry, inferenceProxy, receiptSigner, serverOpts...)
 
 	// Graceful shutdown: stop heartbeat and server.
 	httpServer := &http.Server{Addr: *addr}
@@ -68,6 +84,8 @@ func main() {
 		log.Fatalf("Server failed: %v", err)
 	}
 }
+
+func min(a, b int) int { if a < b { return a }; return b }
 
 // receiptKeyPath returns the path to the Ed25519 signing key.
 // Expands ~ to the user's home directory.

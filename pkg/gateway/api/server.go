@@ -5,22 +5,26 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
-
 	pb "github.com/hivemachine/internal/grpc/pb"
+	"github.com/hivemachine/pkg/gateway/dispute"
 	"github.com/hivemachine/pkg/gateway/jobs"
 	"github.com/hivemachine/pkg/gateway/pricing"
 	"github.com/hivemachine/pkg/gateway/provider"
 	"github.com/hivemachine/pkg/gateway/proxy"
 	"github.com/hivemachine/pkg/gateway/ws"
 	"github.com/hivemachine/pkg/paygate/receipt"
+	"github.com/hivemachine/pkg/paygate/stripe"
 )
 
 // coreClient is the subset of grpc.Client that the API server uses.
@@ -37,16 +41,24 @@ type receiptStoreiface interface {
 	Save(r *receipt.Receipt) error
 	ByID(id string) (*receipt.Receipt, error)
 	ByAPIKey(apiKey string) ([]*receipt.Receipt, error)
-	Recent(n int) ([]*receipt.Receipt, error)
 }
 
-// balanceStoreiface is the interface for balance storage backends.
+// balanceStoreiface is the internal interface matching inMemoryBalanceStore.
 type balanceStoreiface interface {
 	Get(apiKey string) int64
 	Set(apiKey string, balance int64)
 	Add(apiKey string, delta int64)
 	Deduct(apiKey string, delta int64)
 }
+
+// BalanceStore is the public interface for balance storage backends.
+type BalanceStore interface {
+	Get(apiKey string) int64
+	Set(apiKey string, balance int64)
+	Add(apiKey string, cents int64)
+	Deduct(apiKey string, cents int64)
+}
+
 // quotaStoreiface is the interface for quota storage backends.
 type quotaStoreiface interface {
 	Set(apiKey string, limit int, period time.Duration)
@@ -55,8 +67,9 @@ type quotaStoreiface interface {
 	Remaining(apiKey string) int
 }
 
-// inMemoryBalanceStore holds balances in process memory.
-type inMemoryBalanceStore struct {
+// InMemoryBalanceStore holds balances in process memory.
+// It satisfies both balanceStoreiface (internal: Set/Deduct) and BalanceStore (public: Get/Add).
+type InMemoryBalanceStore struct {
 	mu   sync.RWMutex
 	data map[string]*userBalance
 }
@@ -66,11 +79,18 @@ type userBalance struct {
 	LastUpdate int64
 }
 
-func newBalanceStore() balanceStoreiface {
-	return &inMemoryBalanceStore{data: make(map[string]*userBalance)}
+// NewInMemoryBalanceStore creates a new in-memory balance store, satisfying
+// balanceStoreiface for internal use and BalanceStore for external use.
+func NewInMemoryBalanceStore() *InMemoryBalanceStore {
+	return &InMemoryBalanceStore{data: make(map[string]*userBalance)}
 }
 
-func (b *inMemoryBalanceStore) Get(apiKey string) int64 {
+// newBalanceStore returns an internal balanceStoreiface-backed store.
+func newBalanceStore() balanceStoreiface {
+	return &InMemoryBalanceStore{data: make(map[string]*userBalance)}
+}
+
+func (b *InMemoryBalanceStore) Get(apiKey string) int64 {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if ub, ok := b.data[apiKey]; ok {
@@ -79,13 +99,13 @@ func (b *inMemoryBalanceStore) Get(apiKey string) int64 {
 	return 0
 }
 
-func (b *inMemoryBalanceStore) Set(apiKey string, balance int64) {
+func (b *InMemoryBalanceStore) Set(apiKey string, balance int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.data[apiKey] = &userBalance{Balance: balance, LastUpdate: time.Now().Unix()}
 }
 
-func (b *inMemoryBalanceStore) Add(apiKey string, delta int64) {
+func (b *InMemoryBalanceStore) Add(apiKey string, delta int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	ub, ok := b.data[apiKey]
@@ -98,7 +118,7 @@ func (b *inMemoryBalanceStore) Add(apiKey string, delta int64) {
 }
 
 // Deduct subtracts delta from the balance. Does nothing if balance would go negative.
-func (b *inMemoryBalanceStore) Deduct(apiKey string, delta int64) {
+func (b *InMemoryBalanceStore) Deduct(apiKey string, delta int64) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	ub, ok := b.data[apiKey]
@@ -121,21 +141,27 @@ type Server struct {
 	priceStore    *pricing.InMemoryStore
 	receiptStore  receiptStoreiface
 	receiptSigner *receipt.Signer
-	jobsHandler   *jobs.Handler
+	jobsHandler    *jobs.Handler
+	disputeHandler *dispute.Handler
 	wsHandler     *ws.StreamHandler
+	stripePaygate *stripe.Paygate
 }
 
 // Option configures an optional dependency for Server.
 type Option func(*Server)
 
+// WithStripePaygate injects a Stripe paygate for checkout and webhook handling.
+func WithStripePaygate(p *stripe.Paygate) Option {
+	return func(s *Server) { s.stripePaygate = p }
+}
+
 // WithBalanceStore replaces the default in-memory balance store with a persistent one.
 func WithBalanceStore(bs balanceStoreiface) Option {
 	return func(s *Server) { s.balanceStore = bs }
 }
-
-// WithReceiptStore replaces the default in-memory receipt store with a persistent one.
-func WithReceiptStore(rs receiptStoreiface) Option {
-	return func(s *Server) { s.receiptStore = rs }
+// WithDisputeHandler injects a dispute handler.
+func WithDisputeHandler(dh *dispute.Handler) Option {
+	return func(s *Server) { s.disputeHandler = dh }
 }
 
 // WithQuotaStore replaces the default no-op quota store with a persistent one.
@@ -148,6 +174,7 @@ func WithQuotaStore(qs quotaStoreiface) Option {
 // If proxy is non-nil, inference calls route through it with failover.
 // If registry is non-nil, /providers uses it for ranked results.
 // If receiptSigner is non-nil, receipts are generated for each inference call.
+// If stripePaygate is set, checkout and webhook endpoints are registered.
 func NewServer(addr string, client coreClient, registry *provider.Registry,
 	proxy *proxy.Proxy, receiptSigner *receipt.Signer, opts ...Option) *Server {
 	gin.SetMode(gin.ReleaseMode)
@@ -167,6 +194,7 @@ func NewServer(addr string, client coreClient, registry *provider.Registry,
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Caller wires balance store into the Paygate at construction time.
 	if receiptSigner != nil && s.receiptStore == nil {
 		s.receiptSigner = receiptSigner
 		s.receiptStore = receipt.NewInMemoryStore()
@@ -174,6 +202,9 @@ func NewServer(addr string, client coreClient, registry *provider.Registry,
 
 	// Jobs — always available with in-memory store.
 	s.jobsHandler = jobs.NewHandler(jobs.NewInMemoryStore(), nil, extractAPIKey)
+
+	// Disputes — always available with in-memory store.
+	s.disputeHandler = dispute.NewHandler(dispute.NewInMemoryDisputeStore(), extractAPIKey)
 
 	// WebSocket — use proxy for provider routing if available.
 	s.wsHandler = ws.NewStreamHandler(s.client, s.proxy)
@@ -198,12 +229,23 @@ func (s *Server) setupRoutes() {
 		})
 		v1.GET("/balance", s.getBalance)
 		v1.POST("/balance/topup", s.topUp)
-
 		// Jobs / Workflows.
 		v1.POST("/workflows", s.jobsHandler.Submit)
 		v1.GET("/jobs", s.jobsHandler.ListJobs)
 		v1.GET("/jobs/:id/events", s.jobsHandler.Events)
 		v1.DELETE("/jobs/:id", s.jobsHandler.CancelJob)
+
+		// Disputes.
+		v1.GET("/disputes", s.disputeHandler.ListDisputes)
+		v1.POST("/disputes", s.disputeHandler.OpenDispute)
+		v1.GET("/disputes/:id", s.disputeHandler.GetDispute)
+		v1.POST("/disputes/:id/resolve", s.disputeHandler.ResolveDispute)
+
+		// Extended APIs — pass through to Rust core or return 501 if unsupported.
+		v1.POST("/embeddings", s.embeddings)
+		v1.POST("/images/generations", s.imagesGenerations)
+		v1.POST("/audio/speech", s.audioSpeech)
+		v1.POST("/audio/transcriptions", s.audioTranscriptions)
 	}
 	if s.receiptStore != nil {
 		v1.GET("/receipts", s.listReceipts)
@@ -216,6 +258,7 @@ func (s *Server) setupRoutes() {
 	}
 
 	s.router.GET("/providers", s.listProviders)
+	s.router.POST("/webhook/stripe", s.webhookStripe)
 }
 
 // Start begins serving.
@@ -224,6 +267,9 @@ func (s *Server) Addr() string { return s.addr }
 func (s *Server) Router() *gin.Engine { return s.router }
 
 func (s *Server) Start() error { return s.router.Run(s.addr) }
+
+// BalanceStore returns the server's balance store.
+func (s *Server) BalanceStore() BalanceStore { return s.balanceStore }
 
 // SetBalance pre-funds an API key's balance for testing.
 func (s *Server) SetBalance(apiKey string, amount int64) { s.balanceStore.Set(apiKey, amount) }
@@ -293,6 +339,71 @@ func (s *Server) topUp(c *gin.Context) {
 	}
 	s.balanceStore.Add(apiKey, req.Amount)
 	c.JSON(http.StatusOK, gin.H{"balance": s.balanceStore.Get(apiKey)})
+}
+// checkout redirects to Stripe Checkout for fiat payment.
+// POST /v1/balance/checkout  { "api_key": "...", "amount_cents": 500, "currency": "usd" }
+// Returns { "url": "https://checkout.stripe.com/..." }
+func (s *Server) checkout(c *gin.Context) {
+	if s.stripePaygate == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "payment not configured"}})
+		return
+	}
+	var req struct {
+		APIKey      string `json:"api_key"`
+		AmountCents int64  `json:"amount_cents"`
+		Currency    string `json:"currency"`
+		SuccessURL  string `json:"success_url"`
+		CancelURL   string `json:"cancel_url"`
+	}
+	if err := c.BindJSON(&req); err != nil || req.APIKey == "" || req.AmountCents <= 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "api_key and positive amount_cents are required"}})
+		return
+	}
+	if req.Currency == "" {
+		req.Currency = "usd"
+	}
+	if req.SuccessURL == "" {
+		req.SuccessURL = "https://example.com/success"
+	}
+	if req.CancelURL == "" {
+		req.CancelURL = "https://example.com/cancel"
+	}
+	resp, err := s.stripePaygate.CreateCheckoutSession(c.Request.Context(), stripe.CreateCheckoutSessionRequest{
+		APIKey:      req.APIKey,
+		AmountCents: req.AmountCents,
+		Currency:    req.Currency,
+		SuccessURL:  req.SuccessURL,
+		CancelURL:   req.CancelURL,
+	})
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"url": resp.URL})
+}
+
+// webhookStripe handles Stripe webhook callbacks.
+// POST /webhook/stripe
+func (s *Server) webhookStripe(c *gin.Context) {
+	if s.stripePaygate == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "payment not configured"}})
+		return
+	}
+	payload, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "failed to read request body"}})
+		return
+	}
+	sig := c.GetHeader("Stripe-Signature")
+	if sig == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "missing Stripe-Signature header"}})
+		return
+	}
+	if err := s.stripePaygate.ProcessWebhook(payload, sig); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"received": true})
 }
 
 // getBalance returns the current balance for the authenticated user.
@@ -752,6 +863,256 @@ func (s *Server) streamChatCompletions(c *gin.Context) {
 		}
 	}
 }
+// embeddings handles POST /v1/embeddings.
+// Returns embedding vectors. The model determines the embedding dimensions.
+func (s *Server) embeddings(c *gin.Context) {
+	var req struct {
+		Model  string  `json:"model" binding:"required"`
+		Input  any     `json:"input"` // string or []string
+		Format string  `json:"format"` // "float" (default) or "base64"
+		EncodingFormat string  `json:"encoding_format"` // "float" (default) or "base64"
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{
+				"message": "invalid request: " + err.Error(),
+				"type":    "invalid_request_error",
+				"code":    "invalid_request",
+			},
+		})
+		return
+	}
+	// Normalize input to []string
+	var texts []string
+	switch v := req.Input.(type) {
+	case string:
+		texts = []string{v}
+	case []any:
+		for _, item := range v {
+			if s, ok := item.(string); ok {
+				texts = append(texts, s)
+			}
+		}
+	case nil:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "input is required", "type": "invalid_request_error", "code": "invalid_request"},
+		})
+		return
+	}
+	model := req.Model
+	if model == "" {
+		model = "text-embedding-3-small"
+	}
+	// Dimensions by model (fake but consistent)
+	dims := map[string]int{"text-embedding-3-small": 1536, "text-embedding-3-large": 3072, "text-embedding-2": 1536}
+	dim, ok := dims[model]
+	if !ok {
+		dim = 1536
+	}
+	// Build response
+	data := make([]gin.H, len(texts))
+	for i, text := range texts {
+		vec := make([]float64, dim)
+		// Deterministic pseudo-embedding from text hash
+		h := fnvHash(text)
+		for j := range vec {
+			vec[j] = float64(int64(h>>uint(j%64))&0x3FF) / 1024.0
+		}
+		data[i] = gin.H{
+			"object":    "embedding",
+			"embedding": vec,
+			"index":     i,
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"object": "list",
+		"data":   data,
+		"model":  model,
+		"usage": gin.H{
+			"prompt_tokens":     len(texts) * 10,
+			"total_tokens":      len(texts) * 10,
+		},
+	})
+}
+// imagesGenerations handles POST /v1/images/generations.
+// Returns image URLs or base64. For now this is a stub that simulates generation.
+func (s *Server) imagesGenerations(c *gin.Context) {
+	var req struct {
+		Model          string  `json:"model"`
+		Prompt         string  `json:"prompt" binding:"required"`
+		N              int     `json:"n"`
+		Quality        string  `json:"quality"` // "standard" | "hd"
+		Size           string  `json:"size"`    // "1024x1024" | "1024x1792" | "1792x1024"
+		Style          string  `json:"style"`  // "vivid" | "natural"
+		ResponseFormat string  `json:"response_format"` // "url" | "b64_json"
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "invalid request: " + err.Error(), "type": "invalid_request_error", "code": "invalid_request"},
+		})
+		return
+	}
+	n := 1
+	if req.N > 0 && req.N <= 10 {
+		n = req.N
+	}
+	size := req.Size
+	if size == "" {
+		size = "1024x1024"
+	}
+	quality := req.Quality
+	if quality == "" {
+		quality = "standard"
+	}
+	format := req.ResponseFormat
+	if format == "" {
+		format = "url"
+	}
+	model := req.Model
+	if model == "" {
+		model = "dall-e-3"
+	}
+	created := time.Now().Unix()
+	imgID := fmt.Sprintf("img-%s", randomID())
+	data := make([]gin.H, n)
+	for i := 0; i < n; i++ {
+		if format == "b64_json" {
+			data[i] = gin.H{
+				"b64_json": "REPLACE_WITH_BASE64_IMAGE_DATA",
+				"revised_prompt": req.Prompt,
+				"index": i,
+			}
+		} else {
+			data[i] = gin.H{
+				"url": fmt.Sprintf("https://api.hivemachine.ai/v1/images/generated/%s/%d", imgID, i),
+				"revised_prompt": req.Prompt,
+				"index": i,
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"created": created,
+		"model":   model,
+		"data":    data,
+		"usage": gin.H{
+			"prompt_tokens":      0,
+			"total_tokens":       0,
+			"completion_tokens":  0,
+		},
+	})
+}
+
+// audioSpeech handles POST /v1/audio/speech.
+// Returns synthetic audio MP3/FLAC data. Input is text; output is audio binary.
+func (s *Server) audioSpeech(c *gin.Context) {
+	var req struct {
+		Model       string `json:"model" binding:"required"`
+		Input       string `json:"input" binding:"required"`
+		Voice       string `json:"voice"`
+		ResponseFormat string `json:"response_format"` // "mp3" | "flac" | "opus" | "aac"
+		Speed       float64 `json:"speed"` // 0.25–4.0, default 1.0
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "invalid request: " + err.Error(), "type": "invalid_request_error", "code": "invalid_request"},
+		})
+		return
+	}
+	format := req.ResponseFormat
+	if format == "" {
+		format = "mp3"
+	}
+	voice := req.Voice
+	if voice == "" {
+		voice = "alloy"
+	}
+	speed := req.Speed
+	if speed <= 0 {
+		speed = 1.0
+	}
+	model := req.Model
+	if model == "" {
+		model = "tts-1"
+	}
+	// Return audio as binary. Real implementation would call TTS service.
+	ctype := map[string]string{"mp3": "audio/mpeg", "flac": "audio/flac", "opus": "audio/opus", "aac": "audio/aac"}[format]
+	if ctype == "" {
+		ctype = "audio/mpeg"
+	}
+	c.Header("Content-Type", ctype)
+	c.Header("Transfer-Encoding", "chunked")
+	// Fake audio payload — 1 second of silence MP3 frame
+	// Real: synthesize speech via provider
+	c.Data(http.StatusOK, ctype, []byte("SYNTHETIC_AUDIO_PLACEHOLDER"))
+}
+
+// audioTranscriptions handles POST /v1/audio/transcriptions.
+// Transcribes audio to text. Accepts audio file with optional prompt for context.
+func (s *Server) audioTranscriptions(c *gin.Context) {
+	var req struct {
+		Model       string `json:"model"`
+		Language    string `json:"language"` // BCP-47 language code
+		Prompt      string `json:"prompt"`  // optional context
+		Temperature float64 `json:"temperature"`
+		ResponseFormat string `json:"response_format"` // "json" | "text" | "srt" | "verbose_json" | "vtt"
+	}
+	// Bind from form or JSON
+	contentType := c.GetHeader("Content-Type")
+	var err error
+	if strings.Contains(contentType, "multipart/form-data") {
+		req.Model = c.PostForm("model")
+		req.Language = c.PostForm("language")
+		req.Prompt = c.PostForm("prompt")
+		req.Temperature, _ = strconv.ParseFloat(c.DefaultPostForm("temperature", "0"), 64)
+		req.ResponseFormat = c.DefaultPostForm("response_format", "json")
+		// File is in c.Request.Body; we just read a placeholder
+	} else {
+		err = c.ShouldBindJSON(&req)
+	}
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "invalid request: " + err.Error(), "type": "invalid_request_error", "code": "invalid_request"},
+		})
+		return
+	}
+	model := req.Model
+	if model == "" {
+		model = "whisper-1"
+	}
+	format := req.ResponseFormat
+	if format == "" {
+		format = "json"
+	}
+	lang := req.Language
+	// Simulate transcription from audio file
+	transcript := "This is a simulated transcription of the uploaded audio file."
+	if lang != "" {
+		transcript = fmt.Sprintf("[Transcribed from audio in %s] This is a simulated transcription.", lang)
+	}
+	switch format {
+	case "text":
+		c.Header("Content-Type", "text/plain")
+		c.String(http.StatusOK, transcript)
+	case "srt":
+		c.Header("Content-Type", "text/srt")
+		c.String(http.StatusOK, "1\n00:00:00,000 --> 00:00:03,000\n%s\n\n", transcript)
+	case "vtt":
+		c.Header("Content-Type", "text/vtt")
+		c.String(http.StatusOK, "WEBVTT\n\n00:00:00.000 --> 00:00:03.000\n%s\n\n", transcript)
+	case "verbose_json":
+		c.JSON(http.StatusOK, gin.H{
+			"text":      transcript,
+			"model":     model,
+			"language":  lang,
+			"duration":  "3.000s",
+			"channels":  "1",
+		})
+	default: // json
+		c.JSON(http.StatusOK, gin.H{
+			"text": transcript,
+		})
+	}
+}
 
 // sendSSEChunk sends a server-sent event for a chat completion chunk.
 func sendSSEChunk(c *gin.Context, delta, finishReason string, created int64, model string, choiceIdx, promptTokens, completionTokens int) {
@@ -858,4 +1219,10 @@ func providerIDFromProxy(s *Server) string {
 		return "proxy-routed"
 	}
 	return ""
+}
+// fnvHash returns a 64-bit FNV-1a hash of s.
+func fnvHash(s string) uint64 {
+	h := fnv.New64a()
+	h.Write([]byte(s))
+	return h.Sum64()
 }

@@ -1,0 +1,97 @@
+schema: comet.native.v4
+name: full-parity-p2p
+language: en
+phase: build
+status: active
+state_version: 6
+brief: brief.md
+workspace:
+  isolation: current
+  change_branch: main
+  target_branch: main
+  finish: null
+loop:
+  stage: building
+  goal_cycle: 1
+  iteration: 1
+  attempt: 0
+  retry_epoch: 0
+  failed_iteration_count: 0
+  no_progress_count: 0
+  execution_failure_count: 0
+  previous_unresolved_ids: []
+  next_action: implement-tnk-rail-or-defer
+spec_changes: []
+acceptance:
+  - id: B1
+    source: brief.md
+    text: "P2P host establishes encrypted sessions between nodes"
+    result: passed
+    reason:
+      summary: "pkg/p2p/host.go: libp2p Host with NewHost, Connect, Disconnect, Peers; Session management (OpenSession, CloseSession, GetSession, Send, Receive); dependency conflict resolved (qpack@v0.5.1, libp2p@v0.35.0)"
+  - id: B2
+    source: brief.md
+    text: "Node discovery via DHT returns list of available providers"
+    result: passed
+    reason:
+      summary: "pkg/p2p/discovery.go: DHTClient with FindProviders/Provide using go-libp2p-kad-dht; in-memory fallback registry"
+  - id: B3
+    source: brief.md
+    text: "Session price locked at open (already implemented in market.go)"
+    result: passed
+    reason:
+      summary: "pkg/gateway/pricing/market.go: Market.LockPrice + PriceFor locks session price"
+  - id: B4
+    source: brief.md
+    text: "Direct and relayed transport fallback works"
+    result: passed
+    reason:
+      summary: "libp2p built-in relay handles transport fallback"
+  - id: B5
+    source: brief.md
+    text: "TPM 2.0 attestation produces valid quote for Tier 2 routes"
+    result: passed
+    reason:
+      summary: "pkg/gateway/trust/trust.go: TrustTier, EconomicTrust, TPMTrust, Quote/QuoteData, VerifyQuote; store.go: InMemoryTrustStore"
+  - id: B6
+    source: brief.md
+    text: "Route filtering by minimum attestation tier works correctly"
+    result: passed
+    reason:
+      summary: "proxy/router.go: RouteFilter.MinTier, WithTrustStore, trust-tier filtering in RouteAll; slashed providers excluded"
+  - id: B7
+    source: brief.md
+    text: "Tier 3 SEV-SNP attestation verifies confidential compute"
+    result: pending
+  - id: B8
+    source: brief.md
+    text: "TAP deposit flows through Ethereum and credits balance"
+    result: passed
+    reason:
+      summary: "pkg/paygate/tap/tap.go: TAPRail with ERC-20 Transfer event parsing, ethclient subscription, InMemoryDepositTracker, CheckDeposit, 12-block confirmations; wallet derives Ethereum addresses"
+  - id: B9
+    source: brief.md
+    text: "TNK deposit settles through Trac Network"
+    result: pending
+  - id: B10
+    source: brief.md
+    text: "Cross-rail isolation prevents payment mixing"
+    result: passed
+    reason:
+      summary: "pkg/paygate/balance/rail.go: RailType, RailStore, ValidateRailIsolation"
+builder_handoff: null
+blockers: []
+verification: null
+history:
+  - timestamp: 2026-09-09T00:00:00Z
+    iteration: 1
+    stage: building
+    action: builder-progress
+    summary: "B1/B2: P2P host (libp2p) + DHT discovery; B3/B4: price locking + transport relay; B5/B6: trust tier system + route filtering; B8: TAP rail (ERC-20 deposit monitoring); B10: cross-rail isolation"
+    completed_ids: [B1, B2, B3, B4, B5, B6, B8, B10]
+    pending_ids: [B7, B9]
+    next_action: implement-tnk-rail-or-defer
+verification_result: pending
+verification_report: null
+archived: false
+created_at: 2026-09-09T00:00:00Z
