@@ -15,7 +15,7 @@ func TestGenerateMnemonic(t *testing.T) {
 	require.NotEmpty(t, mnemonic)
 
 	// Should have 24 words
-	words := splitMnemonic(mnemonic)
+	words := MnemonicWords(mnemonic)
 	assert.Equal(t, 24, len(words))
 }
 
@@ -241,7 +241,7 @@ func TestMnemonicToSeed(t *testing.T) {
 
 	seed1, err := MnemonicToSeed(mnemonic, passphrase)
 	require.NoError(t, err)
-	assert.Len(t, seed1, 32)
+	assert.Len(t, seed1, 64)
 
 	// Same inputs should produce same seed
 	seed2, err := MnemonicToSeed(mnemonic, passphrase)
@@ -320,7 +320,7 @@ func TestSplitMnemonic(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			words := splitMnemonic(tt.mnemonic)
+			words := MnemonicWords(tt.mnemonic)
 			assert.Equal(t, tt.wantLen, len(words))
 		})
 	}

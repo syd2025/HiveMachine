@@ -39,5 +39,5 @@ func init() {
 	rootCmd.AddCommand(modelsCmd)
 	rootCmd.AddCommand(providerCmd)
 	rootCmd.AddCommand(payCmd)
-	rootCmd.AddCommand(hardwareCmd)
+	rootCmd.AddCommand(walletCmd)
 }

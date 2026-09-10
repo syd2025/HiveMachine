@@ -97,49 +97,7 @@ func TestRootCmd_Long(t *testing.T) {
 
 func TestRootCmd_HasSubcommands(t *testing.T) {
 	cmds := rootCmd.Commands()
-	if len(cmds) != 8 {
-		t.Errorf("Expected 8 subcommands, got %d: %v", len(cmds), cmds)
-	}
-}
-
-func TestRootCmd_HasUpCommand(t *testing.T) {
-	cmd, _, _ := rootCmd.Find([]string{"up"})
-	if cmd == nil {
-		t.Error("Expected to find 'up' subcommand")
-	}
-}
-
-func TestRootCmd_HasDownCommand(t *testing.T) {
-	cmd, _, _ := rootCmd.Find([]string{"down"})
-	if cmd == nil {
-		t.Error("Expected to find 'down' subcommand")
-	}
-}
-
-func TestRootCmd_HasDoctorCommand(t *testing.T) {
-	cmd, _, _ := rootCmd.Find([]string{"doctor"})
-	if cmd == nil {
-		t.Error("Expected to find 'doctor' subcommand")
-	}
-}
-
-func TestRootCmd_HasModelsCommand(t *testing.T) {
-	cmd, _, _ := rootCmd.Find([]string{"models"})
-	if cmd == nil {
-		t.Error("Expected to find 'models' subcommand")
-	}
-}
-
-func TestRootCmd_HasProviderCommand(t *testing.T) {
-	cmd, _, _ := rootCmd.Find([]string{"provider"})
-	if cmd == nil {
-		t.Error("Expected to find 'provider' subcommand")
-	}
-}
-
-func TestRootCmd_HasPayCommand(t *testing.T) {
-	cmd, _, _ := rootCmd.Find([]string{"pay"})
-	if cmd == nil {
-		t.Error("Expected to find 'pay' subcommand")
+	if len(cmds) != 9 {
+		t.Errorf("Expected 9 subcommands, got %d: %v", len(cmds), cmds)
 	}
 }

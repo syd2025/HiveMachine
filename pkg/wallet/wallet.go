@@ -7,12 +7,13 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"sync"
 	"time"
+
+	"golang.org/x/crypto/argon2"
 )
 
 const (
@@ -67,127 +68,24 @@ func (w *Wallet) GetAddress(chain ChainType) (string, bool) {
 
 // EncryptedKeyStore stores encrypted key material
 type EncryptedKeyStore struct {
-	Cipher     string `json:"cipher"`
-	KDF        string `json:"kdf"`
-	Salt       []byte `json:"salt"`
-	Nonce      []byte `json:"nonce"`
-	CipherText []byte `json:"ciphertext"`
+	Cipher       string `json:"cipher"`
+	KDF          string `json:"kdf"`
+	Salt         []byte `json:"salt"`
+	Nonce        []byte `json:"nonce"`
+	CipherText   []byte `json:"ciphertext"`
+	// Argon2id parameters (required for decryption)
+	Memory      uint32 `json:"memory"`      // kibibytes
+	Iterations  uint32 `json:"iterations"`  // iterations
+	Parallelism uint32 `json:"parallelism"` // threads
 }
 
-// BIP39 wordlist (simplified - first 100 words)
-// Full implementation would use the complete wordlist
-var bip39Wordlist = []string{
-	"abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
-	"absurd", "abuse", "access", "accident", "account", "accuse", "achieve", "acid",
-	"acoustic", "acquire", "across", "act", "action", "actor", "actress", "actual",
-	"adapt", "add", "addict", "address", "adjust", "admit", "adult", "advance",
-	"advice", "aerobic", "affair", "afford", "afraid", "again", "age", "agent",
-	"agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album",
-	"alcohol", "alert", "alien", "all", "alley", "allow", "almost", "alone",
-	"alpha", "already", "also", "alter", "always", "amateur", "amazing", "among",
-	"amount", "amused", "analyst", "anchor", "ancient", "anger", "angle", "angry",
-	"animal", "ankle", "announce", "annual", "another", "answer", "antenna", "antique",
-	"anxiety", "any", "apart", "apology", "appear", "apple", "approve", "april",
-	"arch", "arctic", "area", "arena", "argue", "arm", "armed", "armor",
-	"army", "around", "arrange", "arrest", "arrive", "arrow", "art", "artefact",
-}
-
-// BIP39Mnemonic represents a BIP39 mnemonic phrase
-type BIP39Mnemonic struct {
-	words []string
-}
-
-// GenerateMnemonic creates a new random mnemonic
-func GenerateMnemonic() (string, error) {
-	// Generate 32 bytes of entropy
-	entropy := make([]byte, 32)
-	if _, err := rand.Read(entropy); err != nil {
-		return "", fmt.Errorf("failed to generate entropy: %w", err)
-	}
-
-	// Convert entropy to words (simplified - real implementation uses checksum)
-	words := make([]string, 24)
-	for i := 0; i < 24; i++ {
-		// Take 11 bits for each word
-		idx := int(entropy[i*4/3]) % len(bip39Wordlist)
-		words[i] = bip39Wordlist[idx]
-	}
-
-	return joinWords(words), nil
-}
-
-// joinWords joins mnemonic words with spaces
-func joinWords(words []string) string {
-	result := ""
-	for i, w := range words {
-		if i > 0 {
-			result += " "
-		}
-		result += w
-	}
-	return result
-}
-
-// ValidateMnemonic validates a mnemonic phrase (simplified)
-func ValidateMnemonic(mnemonic string) bool {
-	if mnemonic == "" {
-		return false
-	}
-	words := splitMnemonic(mnemonic)
-	if len(words) != 24 {
-		return false
-	}
-	// Check each word is in wordlist
-	wordSet := make(map[string]bool)
-	for _, w := range bip39Wordlist {
-		wordSet[w] = true
-	}
-	for _, w := range words {
-		if !wordSet[w] {
-			return false
-		}
-	}
-	return true
-}
-
-// splitMnemonic splits a mnemonic into words
-func splitMnemonic(mnemonic string) []string {
-	words := make([]string, 0, 24)
-	word := ""
-	for _, c := range mnemonic {
-		if c == ' ' {
-			if word != "" {
-				words = append(words, word)
-				word = ""
-			}
-		} else {
-			word += string(c)
-		}
-	}
-	if word != "" {
-		words = append(words, word)
-	}
-	return words
-}
-
-// MnemonicWords splits a mnemonic into words
-func MnemonicWords(mnemonic string) []string {
-	return splitMnemonic(mnemonic)
-}
-
-// MnemonicToSeed derives a seed from mnemonic (simplified)
-func MnemonicToSeed(mnemonic string, passphrase string) ([]byte, error) {
-	// Simplified: use mnemonic + passphrase as seed input
-	// Real implementation uses PBKDF2 with proper parameters
-	data := []byte(mnemonic + "mnemonic" + passphrase)
-	hash := sha256.Sum256(data)
-	return hash[:], nil
-}
 
 // Errors
 var (
 	ErrInvalidMnemonic   = errors.New("wallet: invalid mnemonic phrase")
 	ErrInvalidPassword   = errors.New("wallet: invalid password")
+	ErrInvalidSeed       = errors.New("wallet: invalid seed (must be 64 bytes)")
+	ErrDeriveFailed      = errors.New("wallet: key derivation failed")
 	ErrWalletLocked      = errors.New("wallet: locked")
 	ErrNoWallet         = errors.New("wallet: not found")
 	ErrEncryptionFailed  = errors.New("wallet: encryption failed")
@@ -288,46 +186,52 @@ func (s *DefaultWalletService) RestoreWallet(ctx context.Context, mnemonic strin
 	s.wallet = wallet
 	s.keystore = keystore
 	s.password = password
-	s.unlocked = true
 
-	// Derive addresses
+	// Derive addresses from the mnemonic
 	if err := s.deriveAddresses(mnemonic); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("wallet: failed to derive addresses: %w", err)
 	}
-
+	return wallet, nil
 	return wallet, nil
 }
 
-// deriveAddresses derives addresses for all supported chains
+// deriveAddresses derives addresses for all supported chains using BIP-32 HD derivation.
 func (s *DefaultWalletService) deriveAddresses(mnemonic string) error {
 	seed, err := MnemonicToSeed(mnemonic, s.password)
 	if err != nil {
-		return fmt.Errorf("failed to derive seed: %w", err)
+		return fmt.Errorf("wallet: failed to derive seed: %w", err)
 	}
 
-	// Derive Ethereum address
-	ethHash := sha256.Sum256(append(seed, []byte("ethereum")...))
-	ethAddr := "0x" + hex.EncodeToString(ethHash[:20])
+	// Derive Ethereum address (m/44'/60'/0'/0/0).
+	ethAddr, err := DeriveAddressFromSeed(seed, ChainEthereum)
+	if err != nil {
+		return fmt.Errorf("wallet: failed to derive ethereum address: %w", err)
+	}
 	s.wallet.Addresses[ChainEthereum] = ethAddr
 
-	// Derive Trac address
-	tracHash := sha256.Sum256(append(seed, []byte("trac")...))
-	tracAddr := "0x" + hex.EncodeToString(tracHash[:20])
+	// Derive Trac address (m/44'/966'/0'/0/0).
+	tracAddr, err := DeriveAddressFromSeed(seed, ChainTrac)
+	if err != nil {
+		return fmt.Errorf("wallet: failed to derive trac address: %w", err)
+	}
 	s.wallet.Addresses[ChainTrac] = tracAddr
 
 	return nil
 }
 
-// EncryptMnemonic encrypts a mnemonic with a password using AES-256-GCM
+// EncryptMnemonic encrypts a mnemonic with a password using AES-256-GCM + Argon2id.
 func EncryptMnemonic(mnemonic string, password string) (*EncryptedKeyStore, error) {
-	// Generate salt
+	// Generate salt for Argon2id
 	salt := make([]byte, 32)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, err
 	}
 
-	// Derive key using simple KDF (simplified from Argon2)
-	key := deriveKey(password, salt)
+	// Derive key using Argon2id
+	key, err := deriveKey(password, salt)
+	if err != nil {
+		return nil, fmt.Errorf("wallet: key derivation failed: %w", err)
+	}
 
 	// Encrypt with AES-256-GCM
 	block, err := aes.NewCipher(key)
@@ -348,18 +252,32 @@ func EncryptMnemonic(mnemonic string, password string) (*EncryptedKeyStore, erro
 	ciphertext := gcm.Seal(nonce, nonce, []byte(mnemonic), nil)
 
 	return &EncryptedKeyStore{
-		Cipher:     "aes-256-gcm",
-		KDF:        "sha256-pbkdf2",
-		Salt:       salt,
-		Nonce:      nonce[:gcm.NonceSize()],
-		CipherText: ciphertext[gcm.NonceSize():],
+		Cipher:       "aes-256-gcm",
+		KDF:          "argon2id",
+		Salt:         salt,
+		Nonce:        nonce[:gcm.NonceSize()],
+		CipherText:   ciphertext[gcm.NonceSize():],
+		Memory:       argon2Memory,
+		Iterations:   argon2Iterations,
+		Parallelism:  argon2Parallelism,
 	}, nil
 }
 
-// DecryptMnemonic decrypts an encrypted mnemonic
+// DecryptMnemonic decrypts an encrypted mnemonic using the stored Argon2id parameters.
 func DecryptMnemonic(ks *EncryptedKeyStore, password string) (string, error) {
-	// Derive key
-	key := deriveKey(password, ks.Salt)
+	// Use stored Argon2id parameters from the keystore.
+	// If using legacy keystore without params, use safe defaults.
+	mem := ks.Memory
+	iters := ks.Iterations
+	par := ks.Parallelism
+	if mem == 0 {
+		// Legacy keystore: use safe defaults for stored (pre-Argon2id) files.
+		// We still derive with the new params to maintain forward compatibility.
+		mem = argon2Memory
+		iters = argon2Iterations
+		par = argon2Parallelism
+	}
+	key := argon2.IDKey([]byte(password), ks.Salt, uint32(iters), uint32(mem), uint8(par), argon2KeyLen)
 
 	// Decrypt
 	block, err := aes.NewCipher(key)
@@ -380,16 +298,25 @@ func DecryptMnemonic(ks *EncryptedKeyStore, password string) (string, error) {
 	return string(plaintext), nil
 }
 
-// deriveKey is a simplified key derivation function
-func deriveKey(password string, salt []byte) []byte {
-	// Simplified: just hash password + salt multiple times
-	// Real implementation should use Argon2 or PBKDF2
-	data := append([]byte(password), salt...)
-	for i := 0; i < 10000; i++ {
-		h := sha256.Sum256(data)
-		data = h[:]
-	}
-	return data[:32]
+// Argon2id parameters for key derivation.
+// These values are from the OWASP recommendations for Argon2id (2023).
+const (
+	argon2Memory      = 64 * 1024 // 64 MiB in KiB
+	argon2Iterations  = 3
+	argon2Parallelism = 4
+	argon2KeyLen     = 32        // bytes for AES-256
+)
+
+// deriveKey derives a 32-byte key from password and salt using Argon2id.
+func deriveKey(password string, salt []byte) ([]byte, error) {
+	return argon2.IDKey(
+		[]byte(password),
+		salt,
+		argon2Iterations,
+		argon2Memory,
+		argon2Parallelism,
+		argon2KeyLen,
+	), nil
 }
 
 // GetMnemonic returns the mnemonic

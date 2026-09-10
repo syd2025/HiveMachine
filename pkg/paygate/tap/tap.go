@@ -100,8 +100,23 @@ func (t *InMemoryDepositTracker) MarkProcessed(txhash string, logIndex uint) {
 	t.processed[t.key(txhash, logIndex)] = true
 }
 
-func (r *TAPRail) Start(ctx context.Context, depositAddr string, credit func(apiKey string, amountWei int64) error) error {
-	addr := common.HexToAddress(depositAddr)
+// creditCallback is called for each confirmed deposit.
+// to is the recipient address parsed from the Transfer event.
+type creditCallback func(to common.Address, amountWei int64) error
+
+// Start begins monitoring the TAP contract for Transfer events to depositAddr.
+// It is equivalent to StartMulti(addrs, credit) when called with a single address.
+func (r *TAPRail) Start(ctx context.Context, depositAddr string, credit func(to common.Address, amountWei int64) error) error {
+	return r.StartMulti(ctx, []string{depositAddr}, credit)
+}
+
+// StartMulti monitors multiple deposit addresses and calls credit for each confirmed deposit.
+func (r *TAPRail) StartMulti(ctx context.Context, depositAddrs []string, credit func(to common.Address, amountWei int64) error) error {
+	addrs := make([]common.Address, len(depositAddrs))
+	for i, s := range depositAddrs {
+		addrs[i] = common.HexToAddress(s)
+	}
+
 	header, err := r.client.HeaderByNumber(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("getting block number: %w", err)
@@ -132,11 +147,47 @@ func (r *TAPRail) Start(ctx context.Context, depositAddr string, credit func(api
 			case <-ctx.Done():
 				return
 			case log := <-logs:
-				r.handleLog(ctx, &log, addr, credit)
+				r.handleLogMulti(ctx, &log, addrs, credit)
 			}
 		}
 	}()
 	return nil
+}
+
+func (r *TAPRail) handleLogMulti(ctx context.Context, log *types.Log, depositAddrs []common.Address, credit func(to common.Address, amountWei int64) error) {
+	to, value, err := parseTransferLog(log)
+	if err != nil {
+		fmt.Printf("[tap] parse error: %v\n", err)
+		return
+	}
+	// Check if this log is for one of our watched addresses.
+	isWatched := false
+	for _, addr := range depositAddrs {
+		if to == addr {
+			isWatched = true
+			break
+		}
+	}
+	if !isWatched {
+		return
+	}
+	header, err := r.client.HeaderByNumber(ctx, nil)
+	if err != nil {
+		fmt.Printf("[tap] header error: %v\n", err)
+		return
+	}
+	confirmations := header.Number.Uint64() - log.BlockNumber
+	if confirmations < r.cfg.DepositConfirmations {
+		return
+	}
+	if r.deposit.IsProcessed(log.TxHash.Hex(), log.Index) {
+		return
+	}
+	if err := credit(to, value.Int64()); err != nil {
+		fmt.Printf("[tap] credit error: %v\n", err)
+		return
+	}
+	r.deposit.MarkProcessed(log.TxHash.Hex(), log.Index)
 }
 
 func (r *TAPRail) handleLog(ctx context.Context, log *types.Log, depositAddr common.Address, credit func(apiKey string, amountWei int64) error) {

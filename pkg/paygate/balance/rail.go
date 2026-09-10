@@ -1,8 +1,10 @@
 package balance
 
 import (
+	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // RailType identifies which payment rail a balance belongs to.
@@ -136,9 +138,49 @@ type RailOperation struct {
 	Cents  int64
 }
 
-// BalanceResponse is the API response for a balance query.
+// DepositResult is returned after initiating a deposit.
+type DepositResult struct {
+	DepositID   string     `json:"deposit_id"`
+	URL         string     `json:"url"`          // Checkout URL (Stripe) or chain address (TAP/TNK)
+	AmountCents int64      `json:"amount_cents"`
+	Currency    string     `json:"currency"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+}
+
+// WithdrawResult is returned after initiating a withdrawal.
+type WithdrawResult struct {
+	WithdrawID string `json:"withdraw_id"`
+	TxHash     string `json:"tx_hash"`
+	Status     string `json:"status"` // "pending", "confirmed", "failed"
+}
+
+// Settlement describes a settled deposit.
+type Settlement struct {
+	DepositID   string    `json:"deposit_id"`
+	ApiKey      string    `json:"api_key"`
+	AmountCents int64     `json:"amount_cents"`
+	Currency    string    `json:"currency"`
+	SettledAt   time.Time `json:"settled_at"`
+	Rail        RailType  `json:"rail"`
+}
+
+// Rail is the interface for a payment rail.
+type Rail interface {
+	Name() string
+
+	// Deposit initiates a deposit and returns the destination (address or URL).
+	Deposit(ctx context.Context, apiKey string, amountCents int64, currency string) (*DepositResult, error)
+
+	// Withdraw initiates a withdrawal.
+	Withdraw(ctx context.Context, apiKey string, amountCents int64, destination string) (*WithdrawResult, error)
+
+	// Balance returns the rail-specific balance in cents.
+	Balance(ctx context.Context, apiKey string) (int64, error)
+}
+
+// BalanceResponse is the API response for a multi-rail balance query.
 type BalanceResponse struct {
-	APIKey      string            `json:"api_key"`
-	Balances    map[RailType]int64 `json:"balances"` // rail → cents
-	TotalCents  int64             `json:"total_cents"` // sum across all rails (informational only)
+	APIKey     string           `json:"api_key"`
+	Balances   map[RailType]int64 `json:"balances"` // rail → cents
+	TotalCents int64            `json:"total_cents"`
 }

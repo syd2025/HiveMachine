@@ -23,6 +23,9 @@ import (
 	"github.com/hivemachine/pkg/gateway/provider"
 	"github.com/hivemachine/pkg/gateway/proxy"
 	"github.com/hivemachine/pkg/gateway/ws"
+	"github.com/hivemachine/pkg/gateway/wallet"
+	"github.com/hivemachine/pkg/p2p"
+	"github.com/hivemachine/pkg/paygate/balance"
 	"github.com/hivemachine/pkg/paygate/receipt"
 	"github.com/hivemachine/pkg/paygate/stripe"
 )
@@ -143,8 +146,11 @@ type Server struct {
 	receiptSigner *receipt.Signer
 	jobsHandler    *jobs.Handler
 	disputeHandler *dispute.Handler
-	wsHandler     *ws.StreamHandler
-	stripePaygate *stripe.Paygate
+	wsHandler      *ws.StreamHandler
+	stripePaygate  *stripe.Paygate
+	railStore      *balance.RailStore
+	walletService  *wallet.Service
+	p2pService     *p2p.P2PService
 }
 
 // Option configures an optional dependency for Server.
@@ -155,18 +161,29 @@ func WithStripePaygate(p *stripe.Paygate) Option {
 	return func(s *Server) { s.stripePaygate = p }
 }
 
-// WithBalanceStore replaces the default in-memory balance store with a persistent one.
+// WithBalanceStore replaces the default in-memory balance store.
 func WithBalanceStore(bs balanceStoreiface) Option {
 	return func(s *Server) { s.balanceStore = bs }
 }
+
+// WithRailStore injects a multi-rail balance store (TAP/TNK support).
+func WithRailStore(rs *balance.RailStore) Option {
+	return func(s *Server) { s.railStore = rs }
+}
+
 // WithDisputeHandler injects a dispute handler.
 func WithDisputeHandler(dh *dispute.Handler) Option {
 	return func(s *Server) { s.disputeHandler = dh }
 }
 
 // WithQuotaStore replaces the default no-op quota store with a persistent one.
-func WithQuotaStore(qs quotaStoreiface) Option {
-	return func(s *Server) { s.quotaStore = qs }
+// WithWalletService injects a wallet service for deposit address lookups.
+func WithWalletService(ws *wallet.Service) Option {
+	return func(s *Server) { s.walletService = ws }
+}
+// WithP2PService injects the P2P networking service.
+func WithP2PService(p2pSvc *p2p.P2PService) Option {
+	return func(s *Server) { s.p2pService = p2pSvc }
 }
 
 // NewServer creates a new gateway server.
@@ -229,7 +246,9 @@ func (s *Server) setupRoutes() {
 		})
 		v1.GET("/balance", s.getBalance)
 		v1.POST("/balance/topup", s.topUp)
-		// Jobs / Workflows.
+		// Multi-rail balance (replaces /balance when railStore is set).
+		v1.GET("/balances", s.getBalances)
+		v1.POST("/balances/deposit", s.deposit)
 		v1.POST("/workflows", s.jobsHandler.Submit)
 		v1.GET("/jobs", s.jobsHandler.ListJobs)
 		v1.GET("/jobs/:id/events", s.jobsHandler.Events)
@@ -256,7 +275,15 @@ func (s *Server) setupRoutes() {
 		v1.GET("/quota", s.getQuota)
 		v1.POST("/quota", s.setQuota)
 	}
-
+	// P2P networking — peer info, DHT provider discovery.
+	if s.p2pService != nil {
+		v1.GET("/p2p/peers", s.p2pPeers)
+		v1.GET("/p2p/info", s.p2pInfo)
+		v1.POST("/p2p/provide", s.p2pProvide)
+		v1.GET("/p2p/providers", s.p2pProviders)
+	}
+	// Wallet — deposit addresses for multi-rail.
+	v1.GET("/wallet/deposit-address", s.walletDepositAddress)
 	s.router.GET("/providers", s.listProviders)
 	s.router.POST("/webhook/stripe", s.webhookStripe)
 }
@@ -1225,4 +1252,204 @@ func fnvHash(s string) uint64 {
 	h := fnv.New64a()
 	h.Write([]byte(s))
 	return h.Sum64()
+}
+// walletDepositAddress handles GET /v1/wallet/deposit-address.
+// Query params: api_key, rail (tap|tap|tnk).
+// Returns the gateway's deposit address for the requested rail.
+func (s *Server) walletDepositAddress(c *gin.Context) {
+	if s.walletService == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"error": gin.H{"message": "wallet service not configured"}})
+		return
+	}
+
+	apiKey := c.Query("api_key")
+	railStr := c.Query("rail")
+	if apiKey == "" || railStr == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "api_key and rail query params are required"}})
+		return
+	}
+
+	var rail balance.RailType
+	switch railStr {
+	case "tap":
+		rail = balance.RailTAP
+	case "tnk":
+		rail = balance.RailTNK
+	case "stripe":
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "stripe does not use a deposit address; use /v1/balance/checkout"}})
+		return
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error": gin.H{"message": "rail must be 'tap' or 'tnk'"}})
+		return
+	}
+
+	addr, err := s.walletService.DepositAddress(c.Request.Context(), apiKey, rail)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": gin.H{"message": err.Error()}})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"rail":    rail.String(),
+		"address": addr,
+	})
+}
+// getBalances returns balances across all payment rails.
+// GET /v1/balances?api_key=...
+func (s *Server) getBalances(c *gin.Context) {
+	apiKey := extractAPIKey(c)
+	if apiKey == "" {
+		apiKey = c.Query("api_key")
+	}
+	if apiKey == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "api_key required"}})
+		return
+	}
+
+	balances := make(map[balance.RailType]int64)
+	total := int64(0)
+
+	// Legacy balance store → Stripe rail.
+	if s.balanceStore != nil {
+		stripeBal := s.balanceStore.Get(apiKey)
+		balances[balance.RailStripe] = stripeBal
+		total += stripeBal
+	}
+
+	// Rail store → TAP, TNK.
+	if s.railStore != nil {
+		for _, rail := range []balance.RailType{balance.RailTAP, balance.RailTNK} {
+			b := s.railStore.Get(apiKey, rail)
+			balances[rail] = b
+			total += b
+		}
+	}
+
+	c.JSON(http.StatusOK, balance.BalanceResponse{
+		APIKey:     apiKey,
+		Balances:   balances,
+		TotalCents: total,
+	})
+}
+
+// deposit initiates a deposit on the specified rail.
+// POST /v1/balances/deposit  { "api_key": "...", "rail": "tap"|"stripe"|"tnk", "amount_cents": 500 }
+// Returns the deposit destination (address or checkout URL).
+func (s *Server) deposit(c *gin.Context) {
+	var req struct {
+		APIKey      string `json:"api_key" binding:"required"`
+		Rail        string `json:"rail" binding:"required"`
+		AmountCents int64  `json:"amount_cents"`
+		Currency    string `json:"currency"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	if req.Currency == "" {
+		req.Currency = "usd"
+	}
+
+	rail := balance.RailType(req.Rail)
+	if !rail.IsValid() {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "rail must be stripe, tap, or tnk"}})
+		return
+	}
+
+	switch rail {
+	case balance.RailStripe:
+		// Redirect to Stripe checkout.
+		c.JSON(http.StatusOK, gin.H{
+			"rail":  "stripe",
+			"url":   "/v1/balance/checkout",
+			"hint":  "use POST /v1/balance/checkout with api_key and amount_cents",
+		})
+		return
+
+	case balance.RailTAP, balance.RailTNK:
+		// Return the deposit address for the specified rail.
+		addr, err := s.walletService.DepositAddress(c.Request.Context(), req.APIKey, rail)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error()}})
+			return
+		}
+		c.JSON(http.StatusOK, balance.DepositResult{
+			DepositID:   addr,
+			URL:        fmt.Sprintf("%s:%s", rail, addr),
+			AmountCents: req.AmountCents,
+			Currency:    req.Currency,
+		})
+		return
+	}
+}
+// p2pPeers returns all connected P2P peers.
+// GET /v1/p2p/peers
+func (s *Server) p2pPeers(c *gin.Context) {
+	peers := s.p2pService.Peers()
+	type peerInfo struct {
+		ID      string   `json:"id"`
+		Address []string `json:"addresses"`
+	}
+	out := make([]peerInfo, 0, len(peers))
+	for _, p := range peers {
+		out = append(out, peerInfo{ID: p.String()})
+	}
+	c.JSON(http.StatusOK, gin.H{"peers": out})
+}
+
+// p2pInfo returns the local P2P node info.
+// GET /v1/p2p/info
+func (s *Server) p2pInfo(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{
+		"peer_id": s.p2pService.ID(),
+		"addrs":   s.p2pService.Addrs(),
+	})
+}
+
+// p2pProvide announces a key via DHT.
+// POST /v1/p2p/provide  { "key": "model:llama-3-8b" }
+func (s *Server) p2pProvide(c *gin.Context) {
+	var req struct{ Key string `json:"key" binding:"required"` }
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	if err := s.p2pService.Provide(c.Request.Context(), req.Key); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"key": req.Key, "status": "provided"})
+}
+
+// p2pProviders searches DHT for providers of a key.
+// GET /v1/p2p/providers?key=model:llama-3-8b
+func (s *Server) p2pProviders(c *gin.Context) {
+	key := c.Query("key")
+	if key == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"message": "key query param required"}})
+		return
+	}
+	providers, err := s.p2pService.FindProviders(c.Request.Context(), key)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": gin.H{"message": err.Error()}})
+		return
+	}
+	type providerInfo struct {
+		PeerID string   `json:"peer_id"`
+		Addrs  []string `json:"addresses"`
+	}
+	out := make([]providerInfo, 0, len(providers))
+	for _, p := range providers {
+		addrs := make([]string, len(p.Addrs))
+		for i, a := range p.Addrs {
+			addrs[i] = a.String()
+		}
+		out = append(out, providerInfo{PeerID: p.ID.String(), Addrs: addrs})
+	}
+	c.JSON(http.StatusOK, gin.H{"key": key, "providers": out})
 }

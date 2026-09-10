@@ -1,6 +1,10 @@
 package trust
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/sha256"
 	"testing"
 	"time"
 )
@@ -121,18 +125,36 @@ func TestVerifyQuote_SessionIDMismatch(t *testing.T) {
 }
 
 func TestVerifyQuote_OK(t *testing.T) {
-	nonce := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
-	quote := Quote{
-		QuoteData: QuoteData{
-			Nonce:     nonce,
-			SessionID: "session-123",
-			Timestamp: time.Now().Unix(),
-			PCRHash:   [32]byte{},
-		},
-		Signature: []byte("sig"),
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("Failed to generate key: %v", err)
 	}
 
-	err := VerifyQuote(nil, quote, nonce, "session-123", "", time.Now())
+	nonce := [16]byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16}
+	q := QuoteData{
+		Nonce:     nonce,
+		SessionID: "session-123",
+		Timestamp: time.Now().Unix(),
+		PCRHash:   [32]byte{},
+	}
+
+	dataBytes, err := encodeQuoteData(q)
+	if err != nil {
+		t.Fatalf("Failed to encode quote data: %v", err)
+	}
+
+	hash := sha256.Sum256(dataBytes)
+	sig, err := ecdsa.SignASN1(rand.Reader, privateKey, hash[:])
+	if err != nil {
+		t.Fatalf("Failed to sign: %v", err)
+	}
+
+	quote := Quote{
+		QuoteData: q,
+		Signature: sig,
+	}
+
+	err = VerifyQuote(&privateKey.PublicKey, quote, nonce, "session-123", "", time.Now())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
